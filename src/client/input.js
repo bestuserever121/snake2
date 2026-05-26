@@ -13,7 +13,7 @@ const KEYBOARD_MAPS = [
  *
  * Returns { dispose, getGamepadStatus, getSlotControlLabels }.
  */
-export function startInputCapture({ net, mySlotIndexes }) {
+export function startInputCapture({ net, mySlotIndexes, onLocalInput }) {
   const lastSentDirection = new Map() // slotIndex -> direction
   let activeGamepadIndex = null
   let lastGamepadDirection = null
@@ -28,6 +28,7 @@ export function startInputCapture({ net, mySlotIndexes }) {
     if (lastSentDirection.get(slotIndex) === direction) return
     lastSentDirection.set(slotIndex, direction)
     net.send({ type: 'input', slotIndex, direction })
+    onLocalInput?.(slotIndex, direction)
   }
 
   function onKeyDown(event) {

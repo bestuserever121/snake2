@@ -1,9 +1,11 @@
 import { startInputCapture } from './input.js'
+import { createPredictor } from './predictor.js'
 
 const CELL_SIZE = 22
 const GRID_WIDTH = 44
 const GRID_HEIGHT = 30
 const FLOATING_MESSAGE_MS = 1600
+const TICK_MS = 50
 
 export function mountGameView(net, { root, roomState, onBackToLobby }) {
   // Find this client's slot indexes.
@@ -11,10 +13,17 @@ export function mountGameView(net, { root, roomState, onBackToLobby }) {
     .map((ownerId, idx) => (ownerId === net.connId ? idx : -1))
     .filter((i) => i !== -1)
 
-  const input = startInputCapture({ net, mySlotIndexes })
+  const predictor = createPredictor(mySlotIndexes)
+  const input = startInputCapture({
+    net,
+    mySlotIndexes,
+    onLocalInput: (slot, dir) => predictor.onLocalInput(slot, dir),
+  })
   const slotControls = input.getSlotControlLabels()
 
-  let latestSnapshot = null
+  let prevSnapshot = null
+  let currSnapshot = null
+  let currReceivedAt = 0
   let isHost = roomState.hostConnId === net.connId
   let stopped = false
   let lastBonusInfo = ''
@@ -66,7 +75,10 @@ export function mountGameView(net, { root, roomState, onBackToLobby }) {
 
   const unsubscribe = net.on((msg) => {
     if (msg.type === 'game-state') {
-      latestSnapshot = msg.state
+      prevSnapshot = currSnapshot
+      currSnapshot = msg.state
+      currReceivedAt = performance.now()
+      predictor.onSnapshot(msg.state)
       renderHud()
     } else if (msg.type === 'room-state') {
       // Host may have changed; update buttons.
@@ -100,12 +112,17 @@ export function mountGameView(net, { root, roomState, onBackToLobby }) {
   let rafId = 0
   function frame() {
     if (stopped) return
-    if (latestSnapshot) draw(latestSnapshot)
+    if (currSnapshot) {
+      const perfNow = performance.now()
+      const serverProgress = Math.max(0, Math.min(1, (perfNow - currReceivedAt) / TICK_MS))
+      const predicted = predictor.getPrediction(perfNow)
+      draw(currSnapshot, prevSnapshot, serverProgress, predicted)
+    }
     rafId = requestAnimationFrame(frame)
   }
   rafId = requestAnimationFrame(frame)
 
-  function draw(snap) {
+  function draw(snap, prev, serverProgress, predicted) {
     const now = Date.now()
 
     ctx.fillStyle = '#0b1220'
@@ -115,8 +132,24 @@ export function mountGameView(net, { root, roomState, onBackToLobby }) {
     drawFoods(ctx, snap.foods)
     drawBonus(ctx, snap.bonus, now)
 
+    const prevById = new Map(prev ? prev.snakes.map((s) => [s.slotIndex, s]) : [])
+    const predNowById = predicted ? new Map(predicted.snakesNow.map((s) => [s.slotIndex, s])) : null
+    const predNextById = predicted ? new Map(predicted.snakesNext.map((s) => [s.slotIndex, s])) : null
+
     for (const snake of snap.snakes) {
-      if (snake.alive) drawSnake(ctx, snake, now)
+      if (!snake.alive) continue
+      if (predicted && predicted.ownSlots.has(snake.slotIndex)) {
+        // Own snake: render predicted, interpolating between predicted-now and predicted-next.
+        const sNow = predNowById.get(snake.slotIndex)
+        const sNext = predNextById.get(snake.slotIndex)
+        if (sNow && sNext && sNow.alive && sNext.alive) {
+          drawSnake(ctx, sNext, sNow, predicted.progress, now)
+          continue
+        }
+      }
+      // Other snakes (or own when prediction unavailable): interpolate server prev->curr.
+      const prevSnake = prevById.get(snake.slotIndex)
+      drawSnake(ctx, snake, prevSnake, serverProgress, now)
     }
 
     drawFloatingMessages(ctx, snap.floatingMessages, now)
@@ -139,33 +172,33 @@ export function mountGameView(net, { root, roomState, onBackToLobby }) {
   }
 
   function renderHud() {
-    if (!latestSnapshot) return
+    if (!currSnapshot) return
     const now = Date.now()
 
     if (statusEl) {
-      const playing = latestSnapshot.status === 'playing'
+      const playing = currSnapshot.status === 'playing'
       statusEl.className = `status ${playing ? 'live' : 'ended'}`
       statusEl.innerHTML = `<span class="status-dot ${playing ? 'live' : 'idle'}"></span>${playing ? 'Läuft' : 'Runde beendet'}`
     }
 
     if (bonusEl) {
       bonusEl.classList.remove('urgent', 'spawned')
-      if (latestSnapshot.bonus) {
-        const remaining = latestSnapshot.bonus.expiresAt - now
+      if (currSnapshot.bonus) {
+        const remaining = currSnapshot.bonus.expiresAt - now
         const secs = Math.max(0, Math.ceil(remaining / 1000))
-        const info = `🎁 ${latestSnapshot.bonus.type.label} · ${secs}s`
+        const info = `🎁 ${currSnapshot.bonus.type.label} · ${secs}s`
         if (info !== lastBonusInfo) { bonusEl.textContent = info; lastBonusInfo = info }
         if (remaining < 2500) bonusEl.classList.add('urgent')
         else bonusEl.classList.add('spawned')
       } else {
-        const secs = Math.max(0, Math.ceil((latestSnapshot.nextBonusSpawnAt - now) / 1000))
+        const secs = Math.max(0, Math.ceil((currSnapshot.nextBonusSpawnAt - now) / 1000))
         const info = `Nächster Bonus in ${secs}s`
         if (info !== lastBonusInfo) { bonusEl.textContent = info; lastBonusInfo = info }
       }
     }
 
     if (panelsEl) {
-      panelsEl.innerHTML = latestSnapshot.snakes.map((s) => renderPanel(s, mySlotIndexes.includes(s.slotIndex), slotControls[s.slotIndex], now)).join('')
+      panelsEl.innerHTML = currSnapshot.snakes.map((s) => renderPanel(s, mySlotIndexes.includes(s.slotIndex), slotControls[s.slotIndex], now)).join('')
     }
 
     if (gamepadStatusEl) {
@@ -307,23 +340,51 @@ function drawBonus(ctx, bonus, now) {
   ctx.beginPath(); ctx.arc(cx, cy, CELL_SIZE * 0.44 * scale, 0, Math.PI * 2); ctx.stroke()
 }
 
-function drawSnake(ctx, snake, now) {
-  for (let i = snake.segments.length - 1; i >= 0; i -= 1) {
-    const seg = snake.segments[i]
-    const x = seg.x * CELL_SIZE
-    const y = seg.y * CELL_SIZE
+function lerpSegment(prev, curr, t) {
+  if (!prev) return curr
+  // Detect wrap (jumped more than 1 cell in any axis) — don't animate across the board.
+  if (Math.abs(curr.x - prev.x) > 1 || Math.abs(curr.y - prev.y) > 1) return curr
+  return { x: prev.x + (curr.x - prev.x) * t, y: prev.y + (curr.y - prev.y) * t }
+}
 
-    if (i === 0) {
-      const wallPassReady = snake.wallPassCooldownUntil <= now
-      const pulse = wallPassReady ? 0 : (Math.sin(now / 120) + 1) / 2
-      const inset = wallPassReady ? 2 : 2 + pulse * 2.6
-      ctx.fillStyle = snake.headColor
-      ctx.fillRect(x + inset, y + inset, CELL_SIZE - inset * 2, CELL_SIZE - inset * 2)
-      continue
-    }
-    ctx.fillStyle = snake.color
-    ctx.fillRect(x + 2, y + 2, CELL_SIZE - 4, CELL_SIZE - 4)
+function drawBodyCell(ctx, pos, color) {
+  ctx.fillStyle = color
+  ctx.fillRect(pos.x * CELL_SIZE + 2, pos.y * CELL_SIZE + 2, CELL_SIZE - 4, CELL_SIZE - 4)
+}
+
+function drawHeadCell(ctx, pos, snake, now) {
+  const wallPassReady = snake.wallPassCooldownUntil <= now
+  const pulse = wallPassReady ? 0 : (Math.sin(now / 120) + 1) / 2
+  const inset = wallPassReady ? 2 : 2 + pulse * 2.6
+  ctx.fillStyle = snake.headColor
+  ctx.fillRect(pos.x * CELL_SIZE + inset, pos.y * CELL_SIZE + inset, CELL_SIZE - inset * 2, CELL_SIZE - inset * 2)
+}
+
+function drawSnake(ctx, snake, prevSnake, progress, now) {
+  const segs = snake.segments
+  const last = segs.length - 1
+
+  // Receding tail: extra cell only present during the tween. Without it,
+  // the snake would have a visible gap because curr's body[last] occupies
+  // a cell that was prev's body[last-1].
+  if (prevSnake && prevSnake.segments.length > 0) {
+    const prevTail = prevSnake.segments[prevSnake.segments.length - 1]
+    const currTail = segs[last]
+    const tailPos = lerpSegment(prevTail, currTail, progress)
+    drawBodyCell(ctx, tailPos, snake.color)
   }
+
+  // Body cells (curr[1..last]).
+  for (let i = last; i >= 1; i -= 1) {
+    drawBodyCell(ctx, segs[i], snake.color)
+  }
+
+  // Head — interpolated from prev head to curr head.
+  let headPos = segs[0]
+  if (prevSnake && prevSnake.segments[0]) {
+    headPos = lerpSegment(prevSnake.segments[0], segs[0], progress)
+  }
+  drawHeadCell(ctx, headPos, snake, now)
 }
 
 function drawFloatingMessages(ctx, messages, now) {

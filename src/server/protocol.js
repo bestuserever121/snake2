@@ -18,4 +18,4 @@ export const SERVER_MSG = {
 
 export const MAX_SLOTS = 4
 export const MAX_LOCAL_SLOTS = 3
-export const TICK_MS = 110
+export const TICK_MS = 50
